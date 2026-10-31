@@ -63,9 +63,12 @@ module.exports = async function handler(req, res) {
   res.setHeader("X-Content-Type-Options", "nosniff");
 
   const reply = (status, body) => res.status(status).json(body);
-  const failGeneric = () =>
-    reply(502, { error: "現在処理できません。しばらくしてからもう一度お試しください。" });
-  // 「存在しないユーザー」「既にメンバー/招待済み」も同一の応答にして、情報を漏らさない
+  const failGeneric = (ghStatus) =>
+    reply(502, {
+      error:
+        "現在処理できません。しばらくしてからもう一度お試しください。" +
+        (ghStatus ? `（GitHub応答: ${ghStatus}）` : ""),
+    });
   const accepted = () =>
     reply(200, {
       message:
@@ -176,10 +179,14 @@ module.exports = async function handler(req, res) {
 
     if (username) {
       const u = await fetch(`${GH}/users/${encodeURIComponent(username)}`, opts());
-      if (u.status === 404) return accepted();
-      if (!u.ok) return failGeneric();
+      if (u.status === 404) {
+        return reply(404, { error: "そのGitHubユーザー名は見つかりません。綴りをご確認ください。" });
+      }
+      if (!u.ok) return failGeneric(u.status);
       const user = await u.json();
-      if (user.type !== "User" || !Number.isInteger(user.id)) return accepted();
+      if (user.type !== "User" || !Number.isInteger(user.id)) {
+        return reply(400, { error: "個人ユーザーのGitHubユーザー名を入力してください。" });
+      }
       payload.invitee_id = user.id;
     } else {
       payload.email = email;
@@ -191,9 +198,34 @@ module.exports = async function handler(req, res) {
       opts({ method: "POST", body: JSON.stringify(payload) })
     );
     if (r.status === 201) return accepted();
-    // 422: 既にメンバー・招待済みなど。存在確認に使われないよう同一応答にする
-    if (r.status === 422) return accepted();
-    return failGeneric();
+    if (r.status === 422) {
+      // 失敗理由を利用者（合言葉を知っている人）に分かる形で返す。サーバーには何も残さない
+      let j = {};
+      try {
+        j = await r.json();
+      } catch (_) {}
+      const detail = String(
+        (j.errors && j.errors[0] && j.errors[0].message) || j.message || ""
+      ).slice(0, 150);
+      const text = JSON.stringify(j).toLowerCase();
+      if (text.includes("already") && (text.includes("part of") || text.includes("member"))) {
+        return reply(409, { error: "すでにこの組織のメンバーです。" });
+      }
+      if (text.includes("already") && (text.includes("invit") || text.includes("pending"))) {
+        return reply(409, {
+          error: "すでに招待済みです。GitHubからの招待メール、または https://github.com/orgs/" +
+            encodeURIComponent(org) + "/invitation をご確認ください。",
+        });
+      }
+      if (text.includes("spam") || text.includes("too many") || text.includes("rate")) {
+        return reply(429, { error: "GitHub側の招待上限に達した可能性があります。時間をおいてお試しください。" });
+      }
+      return reply(422, {
+        error: "GitHubが招待を受け付けませんでした。管理者へご連絡ください。" +
+          (detail ? `（詳細: ${detail}）` : "（422）"),
+      });
+    }
+    return failGeneric(r.status);
   } catch (_) {
     // ログは残さない。詳細は返さない
     return failGeneric();
